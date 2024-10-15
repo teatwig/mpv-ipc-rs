@@ -1,0 +1,15 @@
+[package]
+name = "mpv-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Communicate with mpv over JSON IPC"
+homepage = "https://github.com/JerwuQu/mpv-ipc-rs"
+repository = "https://github.com/JerwuQu/mpv-ipc-rs"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.89"
+log = "0.4.22"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+tokio = { version = "1.40.0", features = ["full"] }
