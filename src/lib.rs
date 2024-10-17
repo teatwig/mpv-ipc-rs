@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use log::{debug, info, trace, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,9 @@ mod mpv_platform {
     pub fn default_ipc_path() -> PathBuf {
         "\\\\.\\pipe\\mpv_ipc".into()
     }
+    pub fn default_mpv_bin() -> PathBuf {
+        "mpv.exe".into()
+    }
 }
 #[cfg(not(target_os = "windows"))]
 mod mpv_platform {
@@ -39,6 +42,9 @@ mod mpv_platform {
     pub fn default_ipc_path() -> PathBuf {
         let dir = std::env::temp_dir();
         dir.join("mpv_ipc.sock")
+    }
+    pub fn default_mpv_bin() -> PathBuf {
+        "mpv".into()
     }
 }
 
@@ -58,9 +64,15 @@ struct MpvResponse {
 type LockedMpvIdMap<T> = Arc<Mutex<HashMap<usize, T>>>;
 type MpvDataOption = Option<serde_json::Value>;
 
-pub struct MpvInstance {
+#[derive(Default)]
+pub struct MpvSpawnOptions {
+    pub mpv_bin: Option<PathBuf>,
+    pub ipc_path: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
+}
+
+pub struct MpvIpc {
     valid: Arc<RwLock<bool>>,
-    child: process::Child,
     writer: WriteHalf<mpv_platform::Stream>,
     request_id: usize,
     requests: LockedMpvIdMap<oneshot::Sender<anyhow::Result<serde_json::Value>>>,
@@ -68,33 +80,16 @@ pub struct MpvInstance {
     observers: LockedMpvIdMap<mpsc::Sender<MpvDataOption>>,
     tasks: Vec<JoinHandle<()>>,
 }
-impl MpvInstance {
-    pub async fn new(
-        mpv_bin: &PathBuf,
-        ipc_path: Option<&PathBuf>,
-        config_dir: Option<&PathBuf>,
-    ) -> anyhow::Result<Self> {
-        let ipc_path = ipc_path.cloned().unwrap_or(mpv_platform::default_ipc_path());
-        let mut args = vec![
-            "--idle".to_owned(),
-            "--input-ipc-server=".to_owned() + &ipc_path.to_string_lossy(),
-        ];
-        if let Some(config_dir) = config_dir {
-            args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
-        }
-        let child = process::Command::new(mpv_bin)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let child_pid = child.id().unwrap();
-        info!("mpv spawned! pid: {}", child_pid);
+impl MpvIpc {
+    pub async fn connect(ipc_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let ipc_path = ipc_path.unwrap_or(mpv_platform::default_ipc_path());
 
+        // Retry before giving up - TODO: only do this in spawn?
         let (mut line_reader, writer): (Lines<_>, WriteHalf<_>) = async {
-            for n in 1..10 {
-                time::sleep(Duration::from_millis(100) * n).await;
+            for n in 0..10 {
+                if n > 0 {
+                    time::sleep(Duration::from_millis(100) * n).await;
+                }
                 if let Ok(stream) = mpv_platform::connect(&ipc_path).await {
                     debug!("Connected to mpv socket");
                     let (reader, writer) = io::split(stream);
@@ -169,19 +164,41 @@ impl MpvInstance {
             }
         });
 
-        let mut sself = Self {
+        Ok(Self {
             valid,
-            child,
             writer,
             request_id: 0,
             requests,
             observers,
             event_handlers,
             tasks: vec![mpv_ipc_task],
-        };
+        })
+    }
+    pub async fn spawn(opt: MpvSpawnOptions) -> anyhow::Result<Self> {
+        let mpv_bin = opt.mpv_bin.unwrap_or(mpv_platform::default_mpv_bin());
+        let ipc_path = opt.ipc_path.unwrap_or(mpv_platform::default_ipc_path());
+        let mut args = vec![
+            "--idle".to_owned(),
+            "--input-ipc-server=".to_owned() + &ipc_path.to_string_lossy(),
+        ];
+        if let Some(config_dir) = opt.config_dir {
+            args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
+        }
+        let child = process::Command::new(mpv_bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn mpv process")?;
+        let child_pid = child.id().unwrap();
+        info!("mpv spawned! pid: {}", child_pid);
 
-        // Post setup sanity check
-        let ipc_pid = sself.get_prop::<u32>("pid").await.unwrap();
+        // Connect
+        let mut sself = Self::connect(Some(ipc_path)).await?;
+
+        // Sanity check
+        let ipc_pid = sself.get_prop::<u32>("pid").await?;
         if ipc_pid != child_pid {
             warn!("mpv process pid and mpv ipc pid don't match. Very suspicious...");
         }
@@ -278,14 +295,16 @@ impl MpvInstance {
         t_rx
     }
 }
-impl Drop for MpvInstance {
+impl Drop for MpvIpc {
     fn drop(&mut self) {
-        for handle in &self.tasks {
-            handle.abort();
-        }
-        self.tasks.clear();
         _ = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async { self.child.kill().await })
+            tokio::runtime::Handle::current().block_on(async {
+                _ = self.send_command(json!(["quit"])).await;
+                for handle in &self.tasks {
+                    handle.abort();
+                }
+                self.tasks.clear();
+            });
         });
     }
 }
