@@ -150,10 +150,10 @@ impl MpvIpc {
                         warn!("Unhandled mpv message: {}", str);
                     }
                 } else {
-                    warn!("Failed to read from mpv ipc. Assuming it was shut down.");
+                    warn!("Failed to read from mpv IPC. Assuming it was shut down.");
                     *valid_ref.write().await = false;
 
-                    // Send shutdown event
+                    // Send faked shutdown event
                     if let Some(list) = event_handlers_ref.lock().await.get("shutdown") {
                         for handler in list {
                             handler.send(json!({"event": "shutdown"})).await.unwrap();
@@ -200,7 +200,7 @@ impl MpvIpc {
         // Sanity check
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
         if ipc_pid != child_pid {
-            warn!("mpv process pid and mpv ipc pid don't match. Very suspicious...");
+            warn!("mpv process pid and mpv ipc pid don't match");
         }
 
         Ok(sself)
@@ -263,7 +263,7 @@ impl MpvIpc {
     }
     pub async fn observe_prop<T: 'static + Send + Sync + Clone + DeserializeOwned>(
         &mut self,
-        name: &str,
+        name: String,
         default: T,
     ) -> watch::Receiver<T> {
         // Create observer
@@ -275,7 +275,6 @@ impl MpvIpc {
 
         // Create converter
         let (t_tx, t_rx) = watch::channel::<T>(default.clone());
-        let name = name.to_owned(); // clone for loop
         self.tasks.push(tokio::spawn(async move {
             loop {
                 if let Some(json) = json_rx.recv().await.unwrap() {
@@ -297,7 +296,7 @@ impl MpvIpc {
 }
 impl Drop for MpvIpc {
     fn drop(&mut self) {
-        _ = tokio::task::block_in_place(move || {
+        tokio::task::block_in_place(move || {
             tokio::runtime::Handle::current().block_on(async {
                 _ = self.send_command(json!(["quit"])).await;
                 for handle in &self.tasks {
