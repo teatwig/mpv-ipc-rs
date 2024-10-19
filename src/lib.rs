@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -234,19 +235,22 @@ impl MpvIpc {
             .await
             .map(|_| ())
     }
-    pub async fn watch_event<A, F, Fut>(&mut self, name: String, callback: F)
-    where
+    pub async fn watch_event<A, F, Fut>(
+        &mut self,
+        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
+        callback: F,
+    ) where
         for<'a> Fut: Future<Output = A> + Send + 'a,
         for<'a> F: (Fn(serde_json::Value) -> Fut) + Send + 'a,
     {
         let (json_tx, mut json_rx) = mpsc::channel::<serde_json::Value>(1);
         let enable = {
             let mut event_handlers = self.borrow_mut().event_handlers.lock().await;
-            if let Some(list) = event_handlers.get_mut(&name) {
+            if let Some(list) = event_handlers.get_mut(name.as_ref()) {
                 list.push(json_tx);
                 false
             } else {
-                _ = event_handlers.insert(name.clone(), vec![json_tx]);
+                _ = event_handlers.insert(name.to_string(), vec![json_tx]);
                 true
             }
         };
@@ -263,7 +267,7 @@ impl MpvIpc {
     }
     pub async fn observe_prop<T: 'static + Send + Sync + Clone + DeserializeOwned>(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
         default: T,
     ) -> watch::Receiver<T> {
         // Create observer
