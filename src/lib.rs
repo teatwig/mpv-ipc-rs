@@ -278,7 +278,8 @@ impl MpvIpc {
         self.send_command(json!(["observe_property", id, name])).await.unwrap();
 
         // Create converter
-        let (t_tx, t_rx) = watch::channel::<T>(default.clone());
+        let init_val = self.get_prop(name.as_ref()).await.unwrap_or_else(|_| default.clone());
+        let (t_tx, t_rx) = watch::channel::<T>(init_val);
         self.tasks.push(tokio::spawn(async move {
             loop {
                 if let Some(json) = json_rx.recv().await.unwrap() {
