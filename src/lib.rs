@@ -65,11 +65,22 @@ struct MpvResponse {
 type LockedMpvIdMap<T> = Arc<Mutex<HashMap<usize, T>>>;
 type MpvDataOption = Option<serde_json::Value>;
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct MpvSpawnOptions {
-    pub mpv_bin: Option<PathBuf>,
-    pub ipc_path: Option<PathBuf>,
+    pub mpv_bin: PathBuf,
+    pub ipc_path: PathBuf,
     pub config_dir: Option<PathBuf>,
+    pub inherit_stdout: bool,
+}
+impl Default for MpvSpawnOptions {
+    fn default() -> Self {
+        Self {
+            mpv_bin: mpv_platform::default_mpv_bin(),
+            ipc_path: mpv_platform::default_ipc_path(),
+            config_dir: None,
+            inherit_stdout: false,
+        }
+    }
 }
 
 pub struct MpvIpc {
@@ -82,16 +93,14 @@ pub struct MpvIpc {
     tasks: Vec<JoinHandle<()>>,
 }
 impl MpvIpc {
-    pub async fn connect(ipc_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let ipc_path = ipc_path.unwrap_or(mpv_platform::default_ipc_path());
-
-        // Retry before giving up - TODO: only do this in spawn?
+    pub async fn connect(ipc_path: &PathBuf) -> anyhow::Result<Self> {
+        // Retry before giving up
         let (mut line_reader, writer): (Lines<_>, WriteHalf<_>) = async {
             for n in 0..10 {
                 if n > 0 {
                     time::sleep(Duration::from_millis(100) * n).await;
                 }
-                if let Ok(stream) = mpv_platform::connect(&ipc_path).await {
+                if let Ok(stream) = mpv_platform::connect(ipc_path).await {
                     debug!("Connected to mpv socket");
                     let (reader, writer) = io::split(stream);
                     let line_reader = BufReader::new(reader).lines();
@@ -175,28 +184,33 @@ impl MpvIpc {
             tasks: vec![mpv_ipc_task],
         })
     }
-    pub async fn spawn(opt: MpvSpawnOptions) -> anyhow::Result<Self> {
-        let mpv_bin = opt.mpv_bin.unwrap_or(mpv_platform::default_mpv_bin());
-        let ipc_path = opt.ipc_path.unwrap_or(mpv_platform::default_ipc_path());
+    pub async fn spawn(opt: &MpvSpawnOptions) -> anyhow::Result<Self> {
         let mut args = vec![
             "--idle".to_owned(),
-            "--input-ipc-server=".to_owned() + &ipc_path.to_string_lossy(),
+            "--input-ipc-server=".to_owned() + &opt.ipc_path.to_string_lossy(),
         ];
-        if let Some(config_dir) = opt.config_dir {
+        if let Some(config_dir) = &opt.config_dir {
             args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
         }
-        let child = process::Command::new(mpv_bin)
+        let stdout_mode = || {
+            if opt.inherit_stdout {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            }
+        };
+        let child = process::Command::new(&opt.mpv_bin)
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdout_mode())
+            .stderr(stdout_mode())
             .spawn()
             .context("Failed to spawn mpv process")?;
         let child_pid = child.id().unwrap();
         info!("mpv spawned! pid: {}", child_pid);
 
         // Connect
-        let mut sself = Self::connect(Some(ipc_path)).await?;
+        let mut sself = Self::connect(&opt.ipc_path).await?;
 
         // Sanity check
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
