@@ -12,9 +12,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
+use tokio::process::Child;
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::{process, time};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "windows")]
 mod mpv_platform {
@@ -84,15 +86,17 @@ impl Default for MpvSpawnOptions {
 }
 
 pub struct MpvIpc {
-    valid: Arc<RwLock<bool>>,
+    shutdown: CancellationToken,
     writer: WriteHalf<mpv_platform::Stream>,
     request_id: usize,
     requests: LockedMpvIdMap<oneshot::Sender<anyhow::Result<serde_json::Value>>>,
     event_handlers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<serde_json::Value>>>>>,
     observers: LockedMpvIdMap<mpsc::Sender<MpvDataOption>>,
     tasks: Vec<JoinHandle<()>>,
+    child: Option<Child>,
 }
 impl MpvIpc {
+    /// Attach to an existing mpv IPC socket.
     pub async fn connect(ipc_path: &PathBuf) -> anyhow::Result<Self> {
         // Retry before giving up
         let (mut line_reader, writer): (Lines<_>, WriteHalf<_>) = async {
@@ -119,76 +123,87 @@ impl MpvIpc {
         let event_handlers = Arc::new(Mutex::new(
             HashMap::<String, Vec<mpsc::Sender<serde_json::Value>>>::new(),
         ));
-        let valid = Arc::new(RwLock::new(true));
+        let shutdown = CancellationToken::new();
 
-        let valid_ref = valid.clone();
+        let shutdown_ref = shutdown.clone();
         let requests_ref = requests.clone();
         let observers_ref = observers.clone();
         let event_handlers_ref = event_handlers.clone();
         let mpv_ipc_task = tokio::spawn(async move {
             loop {
-                if let Ok(Some(str)) = line_reader.next_line().await {
-                    trace!("<-mpv: {}", str);
-                    let json = serde_json::from_str::<serde_json::Value>(str.as_str()).unwrap();
-                    if let Ok(mpv_resp) = MpvResponse::deserialize(&json) {
-                        if let Some(tx) = requests_ref.lock().await.remove(&mpv_resp.request_id) {
-                            if mpv_resp.error == "success" {
-                                tx.send(Ok(mpv_resp.data.unwrap_or(serde_json::Value::Null))).unwrap();
-                            } else {
-                                tx.send(Err(anyhow!(mpv_resp.error))).unwrap();
-                            }
-                        } else {
-                            warn!("Unhandled requests ID {}", mpv_resp.request_id);
-                        }
-                    } else if let Some(event) = json.as_object().and_then(|j| j.get("event")).and_then(|j| j.as_str()) {
-                        trace!("Event '{}'", event);
-                        if let Some(list) = event_handlers_ref.lock().await.get(event) {
-                            for handler in list {
-                                handler.send(json.clone()).await.unwrap();
-                            }
-                        }
-                        if event == "property-change" {
-                            let id = json.as_object().unwrap().get("id").unwrap().as_u64().unwrap() as usize;
-                            if let Some(tx) = observers_ref.lock().await.get(&id) {
-                                let data = json.as_object().unwrap().get("data").map(|d| d.to_owned());
-                                tx.send(data).await.unwrap();
-                            } else {
-                                warn!("Unhandled observable ID {}", id);
-                            }
-                        }
-                        if event == "shutdown" {
-                            info!("Received mpv 'shutdown' event.");
-                            *valid_ref.write().await = false;
-                            break; // stop main loop
-                        }
-                    } else {
-                        warn!("Unhandled mpv message: {}", str);
+                let res = tokio::select! {
+                    line = line_reader.next_line() => { line },
+                    _ = shutdown_ref.cancelled() => {
+                        trace!("Shutdown cancellation. Breaking main loop.");
+                        break;
                     }
-                } else {
-                    warn!("Failed to read from mpv IPC. Assuming 'shutdown'.");
-                    *valid_ref.write().await = false;
+                };
+                let Ok(Some(str)) = res else {
+                    warn!("Failed to read from mpv IPC. Assuming mpv shutdown.");
+                    shutdown_ref.cancel();
+                    // TODO: this should also abort tasks etc
 
-                    // Send faked shutdown event
+                    // Send faked shutdown event to any listeners
                     if let Some(list) = event_handlers_ref.lock().await.get("shutdown") {
                         for handler in list {
                             handler.send(json!({"event": "shutdown"})).await.unwrap();
                         }
                     }
                     break; // stop main loop
+                };
+
+                trace!("<-mpv: {}", str);
+                let json = serde_json::from_str::<serde_json::Value>(str.as_str()).unwrap();
+                if let Ok(mpv_resp) = MpvResponse::deserialize(&json) {
+                    if let Some(tx) = requests_ref.lock().await.remove(&mpv_resp.request_id) {
+                        if mpv_resp.error == "success" {
+                            tx.send(Ok(mpv_resp.data.unwrap_or(serde_json::Value::Null))).unwrap();
+                        } else {
+                            tx.send(Err(anyhow!(mpv_resp.error))).unwrap();
+                        }
+                    } else {
+                        warn!("Unhandled requests ID: {}", mpv_resp.request_id);
+                    }
+                } else if let Some(event) = json.as_object().and_then(|j| j.get("event")).and_then(|j| j.as_str()) {
+                    trace!("Event '{}'", event);
+                    if let Some(list) = event_handlers_ref.lock().await.get(event) {
+                        for handler in list {
+                            handler.send(json.clone()).await.unwrap();
+                        }
+                    }
+                    if event == "property-change" {
+                        let id = json.as_object().unwrap().get("id").unwrap().as_u64().unwrap() as usize;
+                        if let Some(tx) = observers_ref.lock().await.get(&id) {
+                            let data = json.as_object().unwrap().get("data").map(|d| d.to_owned());
+                            tx.send(data).await.unwrap();
+                        } else {
+                            warn!("Unhandled observable ID: {}", id);
+                        }
+                    }
+                    if event == "shutdown" {
+                        info!("Received mpv 'shutdown' event.");
+                        shutdown_ref.cancel();
+                        // TODO: this should also abort tasks etc
+                        break; // stop main loop
+                    }
+                } else {
+                    warn!("Unhandled mpv message: {}", str);
                 }
             }
         });
 
         Ok(Self {
-            valid,
+            shutdown,
             writer,
             request_id: 0,
             requests,
             observers,
             event_handlers,
             tasks: vec![mpv_ipc_task],
+            child: None,
         })
     }
+    /// Spawn a new mpv process and attach to it.
     pub async fn spawn(opt: &MpvSpawnOptions) -> anyhow::Result<Self> {
         let mut args = vec![
             "--idle".to_owned(),
@@ -216,6 +231,7 @@ impl MpvIpc {
 
         // Connect
         let mut sself = Self::connect(&opt.ipc_path).await?;
+        sself.child = Some(child);
 
         // Sanity check
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
@@ -225,12 +241,14 @@ impl MpvIpc {
 
         Ok(sself)
     }
-    pub async fn valid(&self) -> bool {
-        *self.valid.read().await
+    pub async fn running(&self) -> bool {
+        !self.shutdown.is_cancelled()
     }
+    /// Send a command to mpv and wait for a reply.
+    /// This should not be used to `quit` because it will never receive a reply. Use the `quit` function instead.
     pub async fn send_command(&mut self, cmd: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        if !self.valid().await {
-            bail!("mpv instance not valid");
+        if self.shutdown.is_cancelled() {
+            bail!("mpv instance has shut down");
         }
         let (tx, rx) = oneshot::channel::<anyhow::Result<serde_json::Value>>();
         self.request_id += 1;
@@ -241,8 +259,34 @@ impl MpvIpc {
         })
         .unwrap();
         trace!("->mpv: {}", str);
-        self.writer.write_all((str + "\n").as_bytes()).await.unwrap();
-        rx.await.unwrap()
+        self.writer.write_all((str + "\n").as_bytes()).await?;
+        tokio::select! {
+            result = rx => result?,
+            _ = self.shutdown.cancelled() => bail!("mpv shutdown"),
+        }
+    }
+    fn abort_tasks(&mut self) {
+        for handle in &self.tasks {
+            handle.abort();
+        }
+        self.tasks.clear();
+    }
+    /// Shuts down the mpv player and disconnects.
+    pub async fn quit(&mut self) {
+        self.abort_tasks();
+        let quit_fut = self.writer.write_all(("{\"command\":\"quit\"}\n").as_bytes());
+        _ = tokio::time::timeout(Duration::from_secs(2), quit_fut).await;
+        _ = self.writer.shutdown().await;
+        if let Some(child) = &mut self.child {
+            _ = child.kill();
+        }
+        self.shutdown.cancel();
+    }
+    /// Disconnect from the IPC socket.
+    pub async fn disconnect(&mut self) {
+        self.abort_tasks();
+        _ = self.writer.shutdown().await;
+        self.shutdown.cancel();
     }
     pub async fn get_prop<T: DeserializeOwned>(&mut self, name: &str) -> anyhow::Result<T> {
         self.send_command(json!(["get_property", name]))
@@ -322,12 +366,11 @@ impl Drop for MpvIpc {
     fn drop(&mut self) {
         tokio::task::block_in_place(move || {
             tokio::runtime::Handle::current().block_on(async {
-                _ = self.send_command(json!(["quit"])).await;
-                for handle in &self.tasks {
-                    handle.abort();
+                if self.child.is_some() {
+                    self.quit().await;
+                } else {
+                    self.disconnect().await;
                 }
-                self.tasks.clear();
-                _ = self.writer.shutdown().await;
             });
         });
     }
