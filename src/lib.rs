@@ -274,7 +274,7 @@ impl MpvIpc {
     /// Shuts down the mpv player and disconnects.
     pub async fn quit(&mut self) {
         self.abort_tasks();
-        let quit_fut = self.writer.write_all(("{\"command\":\"quit\"}\n").as_bytes());
+        let quit_fut = self.writer.write_all(("{\"command\":[\"quit\"]}\n").as_bytes());
         _ = tokio::time::timeout(Duration::from_secs(2), quit_fut).await;
         _ = self.writer.shutdown().await;
         if let Some(child) = &mut self.child {
