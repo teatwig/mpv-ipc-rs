@@ -3,14 +3,14 @@ use log::{debug, info, trace, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::borrow::BorrowMut;
+use std::borrow::{BorrowMut, Cow};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -18,8 +18,16 @@ use tokio::task::JoinHandle;
 use tokio::{process, time};
 use tokio_util::sync::CancellationToken;
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[cfg(target_os = "windows")]
 mod mpv_platform {
+    use crate::unix_timestamp;
     use std::path::PathBuf;
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
     pub type Stream = NamedPipeClient;
@@ -27,8 +35,8 @@ mod mpv_platform {
         let opts = ClientOptions::new();
         opts.open(path).or(Err(()))
     }
-    pub fn default_ipc_path() -> PathBuf {
-        "\\\\.\\pipe\\mpv_ipc".into()
+    pub fn generate_ipc_path() -> PathBuf {
+        format!("\\\\.\\pipe\\mpv_ipc_{}", unix_timestamp()).into()
     }
     pub fn default_mpv_bin() -> PathBuf {
         "mpv.exe".into()
@@ -36,15 +44,16 @@ mod mpv_platform {
 }
 #[cfg(not(target_os = "windows"))]
 mod mpv_platform {
+    use crate::unix_timestamp;
     use std::path::PathBuf;
     use tokio::net::UnixStream;
     pub type Stream = UnixStream;
     pub async fn connect(path: &PathBuf) -> Result<Stream, ()> {
         UnixStream::connect(&path).await.or(Err(()))
     }
-    pub fn default_ipc_path() -> PathBuf {
+    pub fn generate_ipc_path() -> PathBuf {
         let dir = std::env::temp_dir();
-        dir.join("mpv_ipc.sock")
+        dir.join(format!("mpv_ipc_{}.sock", unix_timestamp()))
     }
     pub fn default_mpv_bin() -> PathBuf {
         "mpv".into()
@@ -69,16 +78,16 @@ type MpvDataOption = Option<serde_json::Value>;
 
 #[derive(Clone)]
 pub struct MpvSpawnOptions {
-    pub mpv_bin: PathBuf,
-    pub ipc_path: PathBuf,
+    pub mpv_path: Option<PathBuf>,
+    pub ipc_path: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
     pub inherit_stdout: bool,
 }
 impl Default for MpvSpawnOptions {
     fn default() -> Self {
         Self {
-            mpv_bin: mpv_platform::default_mpv_bin(),
-            ipc_path: mpv_platform::default_ipc_path(),
+            mpv_path: None,
+            ipc_path: None,
             config_dir: None,
             inherit_stdout: false,
         }
@@ -205,9 +214,19 @@ impl MpvIpc {
     }
     /// Spawn a new mpv process and attach to it.
     pub async fn spawn(opt: &MpvSpawnOptions) -> anyhow::Result<Self> {
+        let mpv_path = opt
+            .mpv_path
+            .as_ref()
+            .map(|v| Cow::Borrowed(v))
+            .unwrap_or_else(|| Cow::Owned(mpv_platform::default_mpv_bin()));
+        let ipc_path = opt
+            .ipc_path
+            .as_ref()
+            .map(|v| Cow::Borrowed(v))
+            .unwrap_or_else(|| Cow::Owned(mpv_platform::generate_ipc_path()));
         let mut args = vec![
             "--idle".to_owned(),
-            "--input-ipc-server=".to_owned() + &opt.ipc_path.to_string_lossy(),
+            "--input-ipc-server=".to_owned() + &ipc_path.to_string_lossy(),
         ];
         if let Some(config_dir) = &opt.config_dir {
             args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
@@ -219,7 +238,7 @@ impl MpvIpc {
                 Stdio::null()
             }
         };
-        let child = process::Command::new(&opt.mpv_bin)
+        let child = process::Command::new(mpv_path.as_ref())
             .args(args)
             .stdin(Stdio::null())
             .stdout(stdout_mode())
@@ -230,7 +249,7 @@ impl MpvIpc {
         info!("mpv spawned! pid: {}", child_pid);
 
         // Connect
-        let mut sself = Self::connect(&opt.ipc_path).await?;
+        let mut sself = Self::connect(&ipc_path).await?;
         sself.child = Some(child);
 
         // Sanity check
