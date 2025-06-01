@@ -79,6 +79,7 @@ type MpvDataOption = Option<serde_json::Value>;
 #[derive(Clone)]
 pub struct MpvSpawnOptions {
     pub mpv_path: Option<PathBuf>,
+    pub mpv_args: Option<Vec<String>>,
     pub ipc_path: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
     pub inherit_stdout: bool,
@@ -87,6 +88,7 @@ impl Default for MpvSpawnOptions {
     fn default() -> Self {
         Self {
             mpv_path: None,
+            mpv_args: None,
             ipc_path: None,
             config_dir: None,
             inherit_stdout: false,
@@ -228,6 +230,9 @@ impl MpvIpc {
             "--idle".to_owned(),
             "--input-ipc-server=".to_owned() + &ipc_path.to_string_lossy(),
         ];
+        if let Some(extra_args) = &opt.mpv_args {
+            args.extend(extra_args.clone());
+        }
         if let Some(config_dir) = &opt.config_dir {
             args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
         }
