@@ -243,6 +243,7 @@ impl MpvIpc {
                 Stdio::null()
             }
         };
+        debug!("mpv args: {}", args.join(" "));
         let child = process::Command::new(mpv_path.as_ref())
             .args(args)
             .stdin(Stdio::null())
