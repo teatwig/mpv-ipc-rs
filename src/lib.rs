@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
 use tokio::process::Child;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::{process, time};
 use tokio_util::sync::CancellationToken;
@@ -102,7 +102,6 @@ pub struct MpvIpc {
     request_id: usize,
     requests: LockedMpvIdMap<oneshot::Sender<anyhow::Result<serde_json::Value>>>,
     event_handlers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<serde_json::Value>>>>>,
-    observers: LockedMpvIdMap<mpsc::Sender<MpvDataOption>>,
     tasks: Vec<JoinHandle<()>>,
     child: Option<Child>,
 }
@@ -130,7 +129,6 @@ impl MpvIpc {
             usize,
             oneshot::Sender<anyhow::Result<serde_json::Value>>,
         >::new()));
-        let observers = Arc::new(Mutex::new(HashMap::<usize, mpsc::Sender<MpvDataOption>>::new()));
         let event_handlers = Arc::new(Mutex::new(
             HashMap::<String, Vec<mpsc::Sender<serde_json::Value>>>::new(),
         ));
@@ -138,7 +136,6 @@ impl MpvIpc {
 
         let shutdown_ref = shutdown.clone();
         let requests_ref = requests.clone();
-        let observers_ref = observers.clone();
         let event_handlers_ref = event_handlers.clone();
         let mpv_ipc_task = tokio::spawn(async move {
             loop {
@@ -182,15 +179,6 @@ impl MpvIpc {
                             handler.send(json.clone()).await.unwrap();
                         }
                     }
-                    if event == "property-change" {
-                        let id = json.as_object().unwrap().get("id").unwrap().as_u64().unwrap() as usize;
-                        if let Some(tx) = observers_ref.lock().await.get(&id) {
-                            let data = json.as_object().unwrap().get("data").map(|d| d.to_owned());
-                            tx.send(data).await.unwrap();
-                        } else {
-                            warn!("Unhandled observable ID: {}", id);
-                        }
-                    }
                     if event == "shutdown" {
                         info!("Received mpv 'shutdown' event.");
                         shutdown_ref.cancel();
@@ -208,7 +196,6 @@ impl MpvIpc {
             writer,
             request_id: 0,
             requests,
-            observers,
             event_handlers,
             tasks: vec![mpv_ipc_task],
             child: None,
@@ -353,38 +340,17 @@ impl MpvIpc {
             }
         }));
     }
-    pub async fn observe_prop<T: 'static + Send + Sync + Clone + DeserializeOwned>(
+
+    /// Returns the request ID for the observed property so it can be unobserved
+    pub async fn observe_prop(
         &mut self,
-        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
-        default: T,
-    ) -> watch::Receiver<T> {
+        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display
+    ) -> anyhow::Result<usize> {
         // Create observer
         self.request_id += 1;
         let id = self.request_id;
-        let (json_tx, mut json_rx) = mpsc::channel::<MpvDataOption>(10);
-        self.observers.lock().await.insert(id, json_tx);
         self.send_command(json!(["observe_property", id, name])).await.unwrap();
-
-        // Create converter
-        let init_val = self.get_prop(name.as_ref()).await.unwrap_or_else(|_| default.clone());
-        let (t_tx, t_rx) = watch::channel::<T>(init_val);
-        self.tasks.push(tokio::spawn(async move {
-            loop {
-                if let Some(json) = json_rx.recv().await.unwrap() {
-                    trace!("Got observed value '{}': {}", name, json);
-                    if let Ok(val) = T::deserialize(&json) {
-                        _ = t_tx.send(val);
-                    } else {
-                        warn!("Failed to deserialize observable '{}'. Using default.", name);
-                        _ = t_tx.send(default.clone());
-                    }
-                } else {
-                    debug!("Observable '{}' updated without a value. Using default.", name);
-                    _ = t_tx.send(default.clone());
-                }
-            }
-        }));
-        t_rx
+        Ok(id)
     }
 }
 impl Drop for MpvIpc {
