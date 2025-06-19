@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context};
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,9 +12,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
-use tokio::process::Child;
+use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 use tokio::{process, time};
 use tokio_util::sync::CancellationToken;
 
@@ -77,12 +77,19 @@ type LockedMpvIdMap<T> = Arc<Mutex<HashMap<usize, T>>>;
 type MpvDataOption = Option<serde_json::Value>;
 
 #[derive(Clone)]
+pub enum StdoutMode {
+    Inherit,
+    Log,
+    None,
+}
+
+#[derive(Clone)]
 pub struct MpvSpawnOptions {
     pub mpv_path: Option<PathBuf>,
     pub mpv_args: Option<Vec<String>>,
     pub ipc_path: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
-    pub inherit_stdout: bool,
+    pub stdout_mode: StdoutMode,
 }
 impl Default for MpvSpawnOptions {
     fn default() -> Self {
@@ -91,7 +98,7 @@ impl Default for MpvSpawnOptions {
             mpv_args: None,
             ipc_path: None,
             config_dir: None,
-            inherit_stdout: false,
+            stdout_mode: StdoutMode::None,
         }
     }
 }
@@ -103,7 +110,7 @@ pub struct MpvIpc {
     requests: LockedMpvIdMap<oneshot::Sender<anyhow::Result<serde_json::Value>>>,
     event_handlers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<serde_json::Value>>>>>,
     tasks: Vec<JoinHandle<()>>,
-    child: Option<Child>,
+    kill_mpv: Option<Sender<()>>,
 }
 impl MpvIpc {
     /// Attach to an existing mpv IPC socket.
@@ -198,7 +205,7 @@ impl MpvIpc {
             requests,
             event_handlers,
             tasks: vec![mpv_ipc_task],
-            child: None,
+            kill_mpv: None,
         })
     }
     /// Spawn a new mpv process and attach to it.
@@ -223,15 +230,13 @@ impl MpvIpc {
         if let Some(config_dir) = &opt.config_dir {
             args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
         }
-        let stdout_mode = || {
-            if opt.inherit_stdout {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            }
+        let stdout_mode = || match opt.stdout_mode {
+            StdoutMode::Inherit => Stdio::inherit(),
+            StdoutMode::Log => Stdio::piped(),
+            StdoutMode::None => Stdio::null(),
         };
         debug!("mpv args: {}", args.join(" "));
-        let child = process::Command::new(mpv_path.as_ref())
+        let mut child = process::Command::new(mpv_path.as_ref())
             .args(args)
             .stdin(Stdio::null())
             .stdout(stdout_mode())
@@ -241,9 +246,39 @@ impl MpvIpc {
         let child_pid = child.id().unwrap();
         info!("mpv spawned! pid: {}", child_pid);
 
+        let (kill_send, kill_recv) = oneshot::channel::<()>();
+
+        let mut child_tasks = vec![];
+        if matches!(opt.stdout_mode, StdoutMode::Log) {
+            let stdout = child.stdout.take().expect("Could not capture stdout for mpv");
+            child_tasks.push(task::spawn(async {
+                let mut stdout = BufReader::new(stdout).lines();
+                while let Some(line) = stdout.next_line().await.unwrap_or_else(|e| Some(e.to_string())) {
+                    if !line.trim().is_empty() {
+                        debug!("mpv(out): {line}");
+                    }
+                }
+            }));
+            let stderr = child.stderr.take().expect("Could not capture stderr for mpv");
+            child_tasks.push(task::spawn(async {
+                let mut stderr = BufReader::new(stderr).lines();
+                while let Some(line) = stderr.next_line().await.unwrap_or_else(|e| Some(e.to_string())) {
+                    if !line.trim().is_empty() {
+                        error!("mpv(err): {line}");
+                    }
+                }
+            }));
+        }
+        child_tasks.push(task::spawn(async move {
+            if kill_recv.await.is_err() {
+                error!("mpv kill handle was dropped");
+            }
+        }));
+
         // Connect
         let mut sself = Self::connect(&ipc_path).await?;
-        sself.child = Some(child);
+        sself.tasks.append(&mut child_tasks);
+        sself.kill_mpv = Some(kill_send);
 
         // Sanity check
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
@@ -289,8 +324,8 @@ impl MpvIpc {
         let quit_fut = self.writer.write_all(("{\"command\":[\"quit\"]}\n").as_bytes());
         _ = tokio::time::timeout(Duration::from_secs(2), quit_fut).await;
         _ = self.writer.shutdown().await;
-        if let Some(child) = &mut self.child {
-            _ = child.kill();
+        if let Some(kill_mpv) = self.kill_mpv.take() {
+            _ = kill_mpv.send(());
         }
         self.shutdown.cancel();
     }
@@ -344,7 +379,7 @@ impl MpvIpc {
     /// Returns the request ID for the observed property so it can be unobserved
     pub async fn observe_prop(
         &mut self,
-        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display
+        name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
     ) -> anyhow::Result<usize> {
         // Create observer
         self.request_id += 1;
@@ -357,7 +392,7 @@ impl Drop for MpvIpc {
     fn drop(&mut self) {
         tokio::task::block_in_place(move || {
             tokio::runtime::Handle::current().block_on(async {
-                if self.child.is_some() {
+                if self.kill_mpv.is_some() {
                     self.quit().await;
                 } else {
                     self.disconnect().await;
