@@ -1,4 +1,3 @@
-use anyhow::{anyhow, bail, Context};
 use log::{debug, error, info, trace, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use thiserror::Error;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -60,6 +60,24 @@ mod mpv_platform {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum MpvIpcError {
+    #[error("failed to spawn mpv process")]
+    Spawn(#[source] io::Error),
+    #[error("failed to connect to mpv socket")]
+    SocketConnection,
+    #[error("failed to deserialize received property")]
+    PropDeserialize(#[source] serde_json::Error),
+    #[error("mpv returned error: {0}")]
+    MpvResp(String),
+    #[error("mpv instance has shut down")]
+    Shutdown,
+    #[error("failed to send command to mpv")]
+    CommandSend(#[source] io::Error),
+    #[error("could not receive command from mpv")]
+    CommandRecv(#[source] oneshot::error::RecvError),
+}
+
 #[derive(Serialize, Deserialize)]
 struct MpvCommand {
     request_id: usize,
@@ -107,14 +125,14 @@ pub struct MpvIpc {
     shutdown: CancellationToken,
     writer: WriteHalf<mpv_platform::Stream>,
     request_id: usize,
-    requests: LockedMpvIdMap<oneshot::Sender<anyhow::Result<serde_json::Value>>>,
+    requests: LockedMpvIdMap<oneshot::Sender<Result<serde_json::Value, MpvIpcError>>>,
     event_handlers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<serde_json::Value>>>>>,
     tasks: Vec<JoinHandle<()>>,
     kill_mpv: Option<Sender<()>>,
 }
 impl MpvIpc {
     /// Attach to an existing mpv IPC socket.
-    pub async fn connect(ipc_path: &PathBuf) -> anyhow::Result<Self> {
+    pub async fn connect(ipc_path: &PathBuf) -> Result<Self, MpvIpcError> {
         // Retry before giving up
         let (mut line_reader, writer): (Lines<_>, WriteHalf<_>) = async {
             for n in 0..10 {
@@ -128,13 +146,13 @@ impl MpvIpc {
                     return Ok((line_reader, writer));
                 }
             }
-            bail!("failed to connect to mpv socket");
+            Err(MpvIpcError::SocketConnection)
         }
         .await?;
 
         let requests = Arc::new(Mutex::new(HashMap::<
             usize,
-            oneshot::Sender<anyhow::Result<serde_json::Value>>,
+            oneshot::Sender<Result<serde_json::Value, MpvIpcError>>,
         >::new()));
         let event_handlers = Arc::new(Mutex::new(
             HashMap::<String, Vec<mpsc::Sender<serde_json::Value>>>::new(),
@@ -174,7 +192,7 @@ impl MpvIpc {
                         if mpv_resp.error == "success" {
                             tx.send(Ok(mpv_resp.data.unwrap_or(serde_json::Value::Null))).unwrap();
                         } else {
-                            tx.send(Err(anyhow!(mpv_resp.error))).unwrap();
+                            tx.send(Err(MpvIpcError::MpvResp(mpv_resp.error))).unwrap();
                         }
                     } else {
                         warn!("Unhandled requests ID: {}", mpv_resp.request_id);
@@ -209,16 +227,16 @@ impl MpvIpc {
         })
     }
     /// Spawn a new mpv process and attach to it.
-    pub async fn spawn(opt: &MpvSpawnOptions) -> anyhow::Result<Self> {
+    pub async fn spawn(opt: &MpvSpawnOptions) -> Result<Self, MpvIpcError> {
         let mpv_path = opt
             .mpv_path
             .as_ref()
-            .map(|v| Cow::Borrowed(v))
+            .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(mpv_platform::default_mpv_bin()));
         let ipc_path = opt
             .ipc_path
             .as_ref()
-            .map(|v| Cow::Borrowed(v))
+            .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(mpv_platform::generate_ipc_path()));
         let mut args = vec![
             "--idle".to_owned(),
@@ -242,7 +260,7 @@ impl MpvIpc {
             .stdout(stdout_mode())
             .stderr(stdout_mode())
             .spawn()
-            .context("Failed to spawn mpv process")?;
+            .map_err(MpvIpcError::Spawn)?;
         let child_pid = child.id().unwrap();
         info!("mpv spawned! pid: {}", child_pid);
 
@@ -293,11 +311,11 @@ impl MpvIpc {
     }
     /// Send a command to mpv and wait for a reply.
     /// This should not be used to `quit` because it will never receive a reply. Use the `quit` function instead.
-    pub async fn send_command(&mut self, cmd: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    pub async fn send_command(&mut self, cmd: serde_json::Value) -> Result<serde_json::Value, MpvIpcError> {
         if self.shutdown.is_cancelled() {
-            bail!("mpv instance has shut down");
+            return Err(MpvIpcError::Shutdown);
         }
-        let (tx, rx) = oneshot::channel::<anyhow::Result<serde_json::Value>>();
+        let (tx, rx) = oneshot::channel::<Result<serde_json::Value, MpvIpcError>>();
         self.request_id += 1;
         self.requests.lock().await.insert(self.request_id, tx);
         let str = serde_json::to_string(&MpvCommand {
@@ -306,10 +324,13 @@ impl MpvIpc {
         })
         .unwrap();
         trace!("->mpv: {}", str);
-        self.writer.write_all((str + "\n").as_bytes()).await?;
+        self.writer
+            .write_all((str + "\n").as_bytes())
+            .await
+            .map_err(MpvIpcError::CommandSend)?;
         tokio::select! {
-            result = rx => result?,
-            _ = self.shutdown.cancelled() => bail!("mpv shutdown"),
+            result = rx => result.map_err(MpvIpcError::CommandRecv)?,
+            _ = self.shutdown.cancelled() => Err(MpvIpcError::Shutdown),
         }
     }
     fn abort_tasks(&mut self) {
@@ -335,12 +356,12 @@ impl MpvIpc {
         _ = self.writer.shutdown().await;
         self.shutdown.cancel();
     }
-    pub async fn get_prop<T: DeserializeOwned>(&mut self, name: &str) -> anyhow::Result<T> {
+    pub async fn get_prop<T: DeserializeOwned>(&mut self, name: &str) -> Result<T, MpvIpcError> {
         self.send_command(json!(["get_property", name]))
             .await
-            .and_then(|json| T::deserialize(json).map_err(|_| anyhow!("failed to deserialize prop")))
+            .and_then(|json| T::deserialize(json).map_err(MpvIpcError::PropDeserialize))
     }
-    pub async fn set_prop(&mut self, name: &str, value: impl Serialize) -> anyhow::Result<()> {
+    pub async fn set_prop(&mut self, name: &str, value: impl Serialize) -> Result<(), MpvIpcError> {
         self.send_command(json!(["set_property", name, value]))
             .await
             .map(|_| ())
@@ -380,7 +401,7 @@ impl MpvIpc {
     pub async fn observe_prop(
         &mut self,
         name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
-    ) -> anyhow::Result<usize> {
+    ) -> Result<usize, MpvIpcError> {
         // Create observer
         self.request_id += 1;
         let id = self.request_id;
