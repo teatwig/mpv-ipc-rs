@@ -41,6 +41,11 @@ mod mpv_platform {
     pub fn default_mpv_bin() -> PathBuf {
         "mpv.exe".into()
     }
+    pub fn ignore_ctrl_c(cmd: &mut tokio::process::Command) {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        // run in a separate process group so ctrl+c is not forwarded
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
 }
 #[cfg(not(target_os = "windows"))]
 mod mpv_platform {
@@ -57,6 +62,15 @@ mod mpv_platform {
     }
     pub fn default_mpv_bin() -> PathBuf {
         "mpv".into()
+    }
+    pub fn ignore_ctrl_c(cmd: &mut tokio::process::Command) {
+        unsafe {
+            cmd.pre_exec(|| {
+                // run in a separate session so ctrl+c is not forwarded
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
 }
 
@@ -254,7 +268,12 @@ impl MpvIpc {
             StdoutMode::None => Stdio::null(),
         };
         debug!("mpv args: {}", args.join(" "));
-        let mut child = process::Command::new(mpv_path.as_ref())
+        let mut cmd = process::Command::new(mpv_path.as_ref());
+        if matches!(opt.stdout_mode, StdoutMode::Log) {
+            // if we don't want to inherit the log we also don't want to handle parent ctrl+c
+            mpv_platform::ignore_ctrl_c(&mut cmd);
+        }
+        let mut child = cmd
             .args(args)
             .stdin(Stdio::null())
             .stdout(stdout_mode())
